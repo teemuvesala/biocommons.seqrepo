@@ -9,6 +9,8 @@ import pkg_resources
 import six
 import yoyo
 
+from .. import sqlfixer
+from ..sqlfixer import S_
 
 
 from .bases import BaseReader, BaseWriter
@@ -52,7 +54,7 @@ class FastaDir(BaseReader, BaseWriter):
 
     """
 
-    def __init__(self, root_dir, writeable=False, check_same_thread=True):
+    def __init__(self, root_dir, writeable=False, check_same_thread=True, db=None, sqlparam='?'):
         """Creates a new sequence repository if necessary, and then opens it"""
 
         self._root_dir = root_dir
@@ -60,16 +62,18 @@ class FastaDir(BaseReader, BaseWriter):
         self._writing = None
         self._db = None
         self._writeable = writeable
-
+        sqlfixer.sql_parameter = sqlparam
         if self._writeable:
             os.makedirs(self._root_dir, exist_ok=True)
             self._upgrade_db()
-
-        self._db = sqlite3.connect(self._db_path,
-                                   check_same_thread=check_same_thread,
-                                   detect_types=sqlite3.PARSE_DECLTYPES)
+        if not db:
+            self._db = sqlite3.connect(self._db_path,
+                                       check_same_thread=check_same_thread,
+                                       detect_types=sqlite3.PARSE_DECLTYPES)
+            self._db.row_factory = sqlite3.Row
+        else:
+            self._db = db
         schema_version = self.schema_version()
-        self._db.row_factory = sqlite3.Row
 
         # if we're not at the expected schema version for this code, bail
         if schema_version != expected_schema_version:
@@ -80,12 +84,16 @@ class FastaDir(BaseReader, BaseWriter):
     # Special methods
 
     def __contains__(self, seq_id):
-        c = self._db.execute("select exists(select 1 from seqinfo where seq_id = ? limit 1) as ex", [seq_id]).fetchone()
+        c = self._fetch_one("select exists(select 1 from seqinfo where seq_id = ? limit 1) as ex",
+                             (seq_id, ))
+
         return True if c["ex"] else False
 
     def __iter__(self):
         sql = "select * from seqinfo order by seq_id"
-        for rec in self._db.execute(sql):
+        cursor = self._db.cursor()
+        cursor.execute(S_(sql))
+        for rec in cursor:
             recd = dict(rec)
             recd["seq"] = self.fetch(rec["seq_id"])
             yield recd
@@ -106,8 +114,7 @@ class FastaDir(BaseReader, BaseWriter):
         """fetch sequence by seq_id, optionally with start, end bounds
 
         """
-        rec = self._db.execute("""select * from seqinfo where seq_id = ? order by added desc""", [seq_id]).fetchone()
-
+        rec = self._fetch_one("""select * from seqinfo where seq_id = ? order by added desc""", [seq_id])
         if rec is None:
             raise KeyError(seq_id)
 
@@ -124,7 +131,8 @@ class FastaDir(BaseReader, BaseWriter):
         """fetch sequence info by seq_id
 
         """
-        rec = self._db.execute("""select * from seqinfo where seq_id = ?""", [seq_id]).fetchone()
+        rec = self._fectch_one("""select * from seqinfo where seq_id = ?""", [seq_id])
+
         if rec is None:
             raise KeyError(seq_id)
         return dict(rec)
@@ -132,9 +140,8 @@ class FastaDir(BaseReader, BaseWriter):
     def schema_version(self):
         """return schema version as integer"""
         try:
-            return int(
-                self._db.execute("""select value from meta
-            where key = 'schema version'""").fetchone()[0])
+            rec = self._fetch_one("select value from meta where key = 'schema version'")
+            return int(rec[0])
         except sqlite3.OperationalError:
             return None
 
@@ -142,7 +149,7 @@ class FastaDir(BaseReader, BaseWriter):
         sql = """select count(distinct seq_id) n_sequences, sum(len) tot_length,
               min(added) min_ts, max(added) as max_ts, count(distinct relpath) as
               n_files from seqinfo"""
-        return dict(self._db.execute(sql).fetchone())
+        return dict(self._fetch_one(sql))
 
     def store(self, seq_id, seq):
         """store a sequence with key seq_id.  The sequence itself is stored in
@@ -172,12 +179,18 @@ class FastaDir(BaseReader, BaseWriter):
 
         self._writing["fabgz"].store(seq_id, seq)
         alpha = "".join(sorted(set(seq)))
-        self._db.execute("""insert into seqinfo (seq_id, len, alpha, relpath)
-                         values (?, ?, ?,?)""", (seq_id, len(seq), alpha, self._writing["relpath"]))
+        cursor = self._db.cursor()
+        cursor.execute(S_("""insert into seqinfo (seq_id, len, alpha, relpath)
+                         values (?, ?, ?,?)"""), (seq_id, len(seq), alpha, self._writing["relpath"]))
         return seq_id
 
     # ############################################################################
     # Internal methods
+
+    def _fetch_one(self, sql, params=()):
+        cursor = self._db.cursor()
+        cursor.execute(S_(sql), params)
+        return cursor.fetchone()
 
     def _upgrade_db(self):
         """upgrade db using scripts for specified (current) schema version"""
@@ -199,6 +212,8 @@ class FastaDir(BaseReader, BaseWriter):
         import prettytable
         fields = "seq_id len alpha added relpath".split()
         pt = prettytable.PrettyTable(field_names=fields)
-        for r in self._db.execute("select * from seqinfo"):
+        cursor = self._db.cursor()
+        cursor.execute("select * from seqinfo")
+        for r in cursor:
             pt.add_row([r[f] for f in fields])
             print(pt)
